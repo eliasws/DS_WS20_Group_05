@@ -70,9 +70,9 @@ class Client:
         self.discovery_service.start()
         self.keybord.start()
 
-        self.keybord.join(1)
-        self.socket_service.join(1)
-        self.discovery_service.join(1)
+        self.keybord.join()
+        self.socket_service.join()
+        self.discovery_service.join()
 
     def on_broadcast_received(self, host: Host, method: str, message: str):
         pass
@@ -167,4 +167,3 @@ try:
     client = Client()
 except KeyboardInterrupt:
     print("Shut down because keyboard interrupted")
-    raise

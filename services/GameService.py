@@ -25,6 +25,16 @@ class GameService:
     def on_unicast_received(self, host, method, message):
         if method == "GS":
             self.on_command_received(host, message)
+        if method == "GS/SYNC_GAMES":
+            for game in self.games:
+                self.socket_service.send_unicast(host, "GS/SYNC", game.to_pickle())
+        if method == "GS/SYNC":
+            game = Game.from_pickle(message)
+
+            if not game:
+                return
+            if game not in self.games:
+                self.games.append(game)
 
     def on_multicast_received(self, host, method, message):
         if method == "MAIN_GROUP/HOSTS":
@@ -39,6 +49,8 @@ class GameService:
                         p = game.get_player(player.id)
                         t_players.append(p)
                     else:
+                        posx, posy = game.get_player_position(player)
+                        game.grid.cells[posy][posx].player = None
                         removed = True
                 game.players = t_players
 

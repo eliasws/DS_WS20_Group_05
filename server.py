@@ -129,6 +129,8 @@ class Server:
 
                 self.all_host_group.announce_participants()
 
+                self.socket_service.send_unicast(self.election_service.current_leader, "GS/SYNC_GAMES", '')
+
                 time.sleep(3)
                 if not self.election_service.leader_elected():
                     self.election_service.start_election()
@@ -170,4 +172,3 @@ try:
     server = Server()
 except KeyboardInterrupt:
     print("Shut down because keyboard interrupted")
-    raise

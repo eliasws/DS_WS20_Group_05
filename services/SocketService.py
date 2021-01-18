@@ -1,5 +1,6 @@
 import datetime
 import json
+import threading
 import uuid
 
 import select
@@ -33,6 +34,8 @@ class SocketService(Thread):
         self.on_broadcast_delivered = None
         self.on_host_failed = on_host_failed
 
+        self.lock = threading.Lock()
+
         self.sockets = [self.unicast_socket, self.broadcast_socket, self.multicast_socket]
 
     def set_on_broadcast_delivered(self, on_broadcast_received):
@@ -52,6 +55,7 @@ class SocketService(Thread):
         return {
             'id': self.own_host.id,
             't': self.own_host.host_type,
+            'a': self.own_host.address,
             'p': self.own_host.unicast_port,
             'm': method
         }
@@ -181,7 +185,26 @@ class SocketService(Thread):
                 f"[MULTICAST:RESENT:{method}] {header} {message if not method == 'GS/OV' else ''} "
                 f"to {self.multicast_socket.address}:{self.multicast_socket.port}")
         header["resent"] = seq
-        encoded_message = self._to_message(header, message)
+
+        self._resend_reliable_group_multicast(
+            group,
+            header,
+            message
+        )
+
+    def _resend_reliable_group_multicast(self, group, original_header, original_message):
+        if DEBUG:
+            print(
+                f"[MULTICAST:RESENT] {original_header} "
+                f"to {self.multicast_socket.address}:{self.multicast_socket.port}")
+        header = {**original_header}
+        header["id"] = self.own_host.id
+        header["t"] = self.own_host.host_type
+        header["p"] = self.own_host.unicast_port
+
+        header["rel_orig_header"] = original_header
+
+        encoded_message = self._to_message(header, original_message)
 
         self.multicast_socket.sendto(
             encoded_message,
@@ -205,17 +228,33 @@ class SocketService(Thread):
              and item.get('state') == DeliveryState.DELIVERABLE),
             None)
 
+    def _send_reliable_multicast(self, header, group, message):
+        with self.lock:
+            header["g_ident"] = group.identifier
+            if header['m'] != 'REL_NACK':
+                header['rel_seq'] = str(group.rel_seq)
+
+            header['rel_delivered_seq'] = group.rel_delivered_seq
+
+            encoded_message = self._to_message(header, message)
+
+            self.multicast_socket.sendto(
+                encoded_message,
+                (self.multicast_socket.address, self.multicast_socket.port)
+            )
+            if header['m'] != 'REL_NACK':
+                group.rel_seq = int(group.rel_seq) + 1
+
     def send_group_multicast(self, group, method: str, message: str = ''):
 
         header = self._get_base_header(method)
-        header["g_ident"] = group.identifier
 
         header['m_id'] = str(uuid.uuid1())  # i
         if DEBUG:
             print(
                 f"[MULTICAST:SENT:{method}] {header} {message if not method == 'GS/OV' else ''} to {self.multicast_socket.address}:{self.multicast_socket.port}")
 
-        encoded_message = self._to_message(header, message)
+        # TODO: remove
         if not method == 'SEQ/ANNOUNCEMENT' and not method == 'NACK':
             self._add_message_to_hold_back(
                 group=group,
@@ -228,9 +267,10 @@ class SocketService(Thread):
                 state=DeliveryState.UNDELIVERABLE
             )
 
-        self.multicast_socket.sendto(
-            encoded_message,
-            (self.multicast_socket.address, self.multicast_socket.port)
+        self._send_reliable_multicast(
+            header,
+            group,
+            message
         )
 
     def _add_message_to_hold_back(self, group, host, header, method, message, sequence, sequence_suggester, state,
@@ -246,6 +286,19 @@ class SocketService(Thread):
             "state": state
         }
         group.hold_back_queue.append(hold_back_message)
+        return hold_back_message
+
+    def _add_rel_message_to_hold_back(self, host, group, seq, header, message):
+        hold_back_message = {
+            "seq": seq,
+            "host": host,
+            "header": header,
+            "message": message,
+        }
+        if not host.id in group.rel_hold_back_queue:
+            group.rel_hold_back_queue[host.id] = []
+
+        group.rel_hold_back_queue[host.id].append(hold_back_message)
         return hold_back_message
 
     def _check_queue_for_max_number(self, group):
@@ -274,14 +327,10 @@ class SocketService(Thread):
                 list_copy.append(item)
         group.hold_back_queue = list_copy
 
-    def _on_multicast_received(self, header, host: Host, method, message: str):
-
+    def _on_reliable_multicast_received(self, header, host, method, message):
         if 't' in header and header.get('t') == 'monitor':
             self.on_multicast_delivered(host, method, message, header)
             return
-
-        if "g_ident" not in header:
-            raise Exception("Could not find valid header", header)
 
         group_identifier = header["g_ident"]
         group = self._find_group(group_identifier)
@@ -289,6 +338,77 @@ class SocketService(Thread):
         if not group:
             print(f"Not in group {group_identifier}, discard")
             return
+
+        if method == "REL_NACK":
+            payload = json.loads(message)
+            missing_sender_id = payload.get('s')
+            missing_seq = payload.get('seq')
+            if missing_sender_id in group.rel_message_history:
+                process_messages = group.rel_message_history[missing_sender_id]
+                if missing_seq in process_messages:
+                    missed_message = group.rel_message_history[missing_sender_id][missing_seq]
+                    if missed_message:
+                        self._resend_reliable_group_multicast(group,
+                                                              missed_message.get("header"),
+                                                              missed_message.get("message")
+                                                              )
+        else:
+            host = host
+            if 'rel_orig_header' in header:
+                original_header = header['rel_orig_header']
+                host = Host(
+                    id=original_header['id'],
+                    address=original_header['a'],
+                    unicast_port=original_header['p'],
+                    host_type=original_header['t']
+                )
+
+            acknowledgements = header.get('rel_delivered_seq')
+
+            if host.id not in group.rel_delivered_seq:
+                group.rel_delivered_seq[host.id] = int(header['rel_seq']) - 1
+
+            last_delivered_from_process = group.rel_delivered_seq[host.id]
+
+            self._add_rel_message_to_hold_back(host, group, header['rel_seq'], header, message)
+            group.rel_hold_back_queue[host.id] = sorted(group.rel_hold_back_queue[host.id],
+                                                        key=lambda t: t.get("seq"))
+            hold_back_copy = []
+            for item in group.rel_hold_back_queue[host.id]:
+                process_group_seq = item['seq']
+                if int(process_group_seq) == last_delivered_from_process + 1:
+                    if host.id not in group.rel_delivered_seq:
+                        group.rel_delivered_seq[host] = -1
+                    group.rel_delivered_seq[host.id] = group.rel_delivered_seq[host.id] + 1
+                    if host.id not in group.rel_message_history:
+                        group.rel_message_history[host.id] = {}
+                    group.rel_message_history[host.id][process_group_seq] = item
+
+                    self._on_multicast_received(host, group, item['header'], item['header']['m'], item['message'])
+                elif int(process_group_seq) <= last_delivered_from_process:
+                    if DEBUG:
+                        pass
+                        # print("already seen, drop", process_group_seq)
+                else:
+                    hold_back_copy.append(item)
+                    missing_messages = {}
+                    for ack_host, ack_seq in acknowledgements.items():
+                        if ack_host not in group.rel_delivered_seq:
+                            group.rel_delivered_seq[ack_host] = int(ack_seq) - 1
+                        if ack_seq > group.rel_delivered_seq[ack_host]:
+                            missing_messages[ack_host] = ack_seq
+
+                    if len(missing_messages.keys()) > 0:
+                        for host_id, last_acK in sorted(missing_messages.items(), key=lambda t: t[1]):
+                            for sequence_number in range(group.rel_delivered_seq[host_id] + 1, last_acK + 1):
+                                existing = [holdback for holdback in group.rel_hold_back_queue[host_id]
+                                            if holdback.get("seq") == sequence_number]
+                                if len(existing) == 0:
+                                    self._send_rel_group_multicast_nack(group, host_id, sequence_number)
+
+            group.rel_hold_back_queue[host.id] = hold_back_copy
+
+    def _on_multicast_received(self, host: Host, group, header, method, message: str):
 
         if method == "NACK":
             payload = json.loads(message)
@@ -327,6 +447,9 @@ class SocketService(Thread):
             hold_back_message['max_suggested_process_id'] = max_suggested_process_id
             hold_back_message['state'] = DeliveryState.DELIVERABLE
 
+            if not group.group_last_message_delivered_seq:
+                group.group_last_message_delivered_seq = max_suggested_seq - 1
+
             if max_suggested_seq <= group.group_last_message_delivered_seq:
                 if DEBUG:
                     print(
@@ -337,9 +460,11 @@ class SocketService(Thread):
             elif max_suggested_seq > group.group_last_message_delivered_seq + 1:
                 # TODO: Dont request the messages we already have!
                 sequences = list(range(group.group_last_message_delivered_seq + 1, max_suggested_seq))
+                seq_copy = []
                 for sq in sequences:
-                    if self._find_hold_back_message_by_deliverable(group, sq):
-                        sequences.remove(sq)
+                    if not self._find_hold_back_message_by_deliverable(group, sq):
+                        seq_copy.append(sq)
+                sequences = seq_copy
                 if DEBUG:
                     print(f"MISSING MESSAGE; GOT {max_suggested_seq},  SENDING NACK FOR ", sequences)
                 self._send_group_multicast_nack(group, json.dumps(sequences))
@@ -397,7 +522,7 @@ class SocketService(Thread):
                     json.dumps({
                         'm_id': header.get('m_id'),
                         's_seq': sequence,
-                        'g_id': group_identifier,
+                        'g_id': group.identifier,
                     }),
                 )
 
@@ -407,6 +532,16 @@ class SocketService(Thread):
         self.send_group_multicast(
             group,
             method,
+            json.dumps(payload),
+        )
+
+    def _send_rel_group_multicast_nack(self, group, sender_id, seq):
+        method = 'REL_NACK'
+        header = self._get_base_header(method)
+        payload = {"s": sender_id, "seq": str(seq)}
+        self._send_reliable_multicast(
+            header,
+            group,
             json.dumps(payload),
         )
 
@@ -440,7 +575,7 @@ class SocketService(Thread):
                     elif receiver == self.unicast_socket:
                         self._on_unicast_received(header, host, method, payload)
                     elif receiver == self.multicast_socket:
-                        self._on_multicast_received(header, host, method, payload)
+                        self._on_reliable_multicast_received(header, host, method, payload)
                 except Exception as e:
                     if e and hasattr(e, 'errno') and e.errno == 10054:
                         self.on_host_failed()

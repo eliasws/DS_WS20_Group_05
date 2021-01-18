@@ -13,10 +13,18 @@ class Group:
         self.socket_service = socket_service
         self.participants = []
 
-        self.group_last_message_delivered_seq = 0
+        self.group_last_message_delivered_seq = None
         self.hold_back_queue = []
         self.message_history = {}
         self.suggested_sequence_number = 0
+
+        #New
+        self.rel_seq = 0  # S
+        self.rel_delivered_seq = {}  # R
+        # TODO: remove?
+        self.rel_hold_back_queue = {}
+        self.rel_message_history = {}
+        self.group_sent_messages = {}
 
     def on_multicast_received(self, host, method: str, message, header):
         if method == "MAIN_GROUP/HOSTS":
